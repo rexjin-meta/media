@@ -165,6 +165,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       createFragment();
     }
     track.writeSampleData(byteBuffer, bufferInfo);
+    if (track.pendingSamplesBufferInfo.isEmpty()) {
+      // The sample was not enqueued (empty/end-of-stream buffer, or a video sample before the
+      // first key frame), so there is no pending sample to update timing from.
+      return;
+    }
     BufferInfo firstPendingSample = checkNotNull(track.pendingSamplesBufferInfo.peekFirst());
     BufferInfo lastPendingSample = checkNotNull(track.pendingSamplesBufferInfo.peekLast());
     minInputPresentationTimeUs =

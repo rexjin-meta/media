@@ -17,8 +17,10 @@ package androidx.media3.muxer;
 
 import static androidx.media3.muxer.MuxerTestUtil.feedInputDataToMuxer;
 import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.truth.Truth.assertThat;
 
 import android.content.Context;
+import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.container.Mp4TimestampData;
@@ -30,6 +32,7 @@ import androidx.media3.test.utils.FakeExtractorOutput;
 import androidx.media3.test.utils.TestUtil;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import java.io.File;
 import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
 import org.junit.Rule;
@@ -165,6 +168,35 @@ public class FragmentedMp4MuxerEndToEndTest {
         fakeExtractorOutput,
         MuxerTestUtil.getExpectedDumpFilePath(
             MuxerTestUtil.getSubstitutedPath(H264_MP4, MuxerTestUtil.MP4) + "_fragmented"));
+  }
+
+  @Test
+  public void writeSampleData_firstSampleIsEmptyEndOfStreamBuffer_doesNotThrow() throws Exception {
+    String outputFilePath = temporaryFolder.newFile().getPath();
+    Format trackFormat = new Format.Builder().setSampleMimeType(MimeTypes.APPLICATION_META).build();
+
+    try (FragmentedMp4Muxer muxer =
+        new FragmentedMp4Muxer.Builder(new FileOutputStream(outputFilePath).getChannel()).build()) {
+      muxer.addMetadataEntry(
+          new Mp4TimestampData(
+              /* creationTimestampSeconds= */ 1_000_000L,
+              /* modificationTimestampSeconds= */ 5_000_000L));
+      int trackId = muxer.addTrack(trackFormat);
+
+      // The first (and only) buffer for the track is an empty end-of-stream buffer, which
+      // Track.writeSampleData drops without enqueuing. Regression test for a NullPointerException
+      // where FragmentedMp4Writer dereferenced the then-empty pendingSamplesBufferInfo deque.
+      muxer.writeSampleData(
+          trackId,
+          ByteBuffer.allocate(0),
+          new BufferInfo(
+              /* presentationTimeUs= */ 0L,
+              /* size= */ 0,
+              /* flags= */ C.BUFFER_FLAG_END_OF_STREAM));
+    }
+
+    // The muxer should still write a valid (header-only) file rather than crashing.
+    assertThat(new File(outputFilePath).length()).isGreaterThan(0L);
   }
 
   @Test
