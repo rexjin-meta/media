@@ -17,6 +17,7 @@ package androidx.media3.muxer;
 
 import static androidx.media3.muxer.MuxerTestUtil.feedInputDataToMuxer;
 import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.truth.Truth.assertThat;
 
 import android.content.Context;
 import androidx.media3.common.Format;
@@ -27,6 +28,7 @@ import androidx.media3.extractor.text.DefaultSubtitleParserFactory;
 import androidx.media3.test.utils.DumpFileAsserts;
 import androidx.media3.test.utils.DumpableMp4Box;
 import androidx.media3.test.utils.FakeExtractorOutput;
+import androidx.media3.test.utils.FakeTrackOutput;
 import androidx.media3.test.utils.TestUtil;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
@@ -45,6 +47,7 @@ public class FragmentedMp4MuxerEndToEndTest {
   private static final String H265_HDR10_MP4 = "mp4/hdr10-720p.mp4";
   private static final String AV1_MP4 = "mp4/sample_av1.mp4";
   private static final String AUDIO_ONLY_MP4 = "mp4/sample_audio_only_15s.mp4";
+  private static final String VP9_WEBM = "vp9/bear-vp9.webm";
 
   public static final String MEDIA_ASSET_DIRECTORY = "asset:///media/";
 
@@ -165,6 +168,68 @@ public class FragmentedMp4MuxerEndToEndTest {
         fakeExtractorOutput,
         MuxerTestUtil.getExpectedDumpFilePath(
             MuxerTestUtil.getSubstitutedPath(H264_MP4, MuxerTestUtil.MP4) + "_fragmented"));
+  }
+
+  @Test
+  public void createFragmentedMp4File_fromVp9WithoutCsd_producesPlayableVp9Track() throws Exception {
+    // VP9 samples carry no codec-specific data, so the muxer must derive it from the first sample
+    // (as the non-fragmented Mp4Writer already does). Without this, muxing a VP9 track throws a
+    // NullPointerException while building the moov header.
+    String outputFilePath = temporaryFolder.newFile().getPath();
+
+    try (FragmentedMp4Muxer muxer =
+        new FragmentedMp4Muxer.Builder(new FileOutputStream(outputFilePath).getChannel()).build()) {
+      muxer.addMetadataEntry(
+          new Mp4TimestampData(
+              /* creationTimestampSeconds= */ 100_000_000L,
+              /* modificationTimestampSeconds= */ 500_000_000L));
+      feedInputDataToMuxer(
+          context,
+          muxer,
+          MEDIA_ASSET_DIRECTORY + VP9_WEBM,
+          /* removeInitializationData= */ true,
+          /* removeAudioSampleFlags= */ false);
+    }
+
+    FakeExtractorOutput fakeExtractorOutput =
+        TestUtil.extractAllSamplesFromFilePath(
+            new FragmentedMp4Extractor(new DefaultSubtitleParserFactory()),
+            checkNotNull(outputFilePath));
+    assertThat(fakeExtractorOutput.numberOfTracks).isEqualTo(1);
+    FakeTrackOutput videoTrackOutput = fakeExtractorOutput.trackOutputs.valueAt(0);
+    assertThat(checkNotNull(videoTrackOutput.lastFormat).sampleMimeType)
+        .isEqualTo(MimeTypes.VIDEO_VP9);
+    assertThat(videoTrackOutput.getSampleCount()).isGreaterThan(0);
+  }
+
+  @Test
+  public void writeSampleData_av1TrackWithAudioSampleWrittenFirst_doesNotThrow() throws Exception {
+    // The moov header (covering all tracks) is built on the first writeSampleData call. Writing a
+    // non-AV1 sample before the AV1 track's first sample must not crash, even though the AV1
+    // codec-specific data (derived from its first sample) is not yet available.
+    String outputFilePath = temporaryFolder.newFile().getPath();
+    Format av1Format =
+        new Format.Builder()
+            .setSampleMimeType(MimeTypes.VIDEO_AV1)
+            .setWidth(1920)
+            .setHeight(1080)
+            .build();
+    Format aacFormat =
+        new Format.Builder()
+            .setSampleMimeType(MimeTypes.AUDIO_AAC)
+            .setChannelCount(2)
+            .setSampleRate(44100)
+            .build();
+
+    try (FragmentedMp4Muxer muxer =
+        new FragmentedMp4Muxer.Builder(new FileOutputStream(outputFilePath).getChannel()).build()) {
+      muxer.addTrack(av1Format);
+      int audioTrackId = muxer.addTrack(aacFormat);
+      muxer.writeSampleData(
+          audioTrackId,
+          ByteBuffer.wrap(new byte[] {0x01, 0x02, 0x03, 0x04}),
+          new BufferInfo(/* presentationTimeUs= */ 0L, /* size= */ 4, /* flags= */ 0));
+    }
   }
 
   @Test

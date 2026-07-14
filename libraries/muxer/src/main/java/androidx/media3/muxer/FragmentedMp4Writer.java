@@ -15,6 +15,7 @@
  */
 package androidx.media3.muxer;
 
+import static androidx.media3.common.util.CodecSpecificDataUtil.buildVp9CodecPrivateFromUncompressedHeader;
 import static androidx.media3.muxer.AnnexBUtils.doesSampleContainAnnexBNalUnits;
 import static androidx.media3.muxer.Av1ConfigUtil.createAv1CodecConfigurationRecord;
 import static androidx.media3.muxer.Boxes.BOX_HEADER_SIZE;
@@ -152,12 +153,26 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
   public void writeSampleData(Track track, ByteBuffer byteBuffer, BufferInfo bufferInfo)
       throws IOException {
-    if (Objects.equals(track.format.sampleMimeType, MimeTypes.VIDEO_AV1)
-        && track.format.initializationData.isEmpty()
-        && track.parsedCsd == null) {
-      track.parsedCsd = createAv1CodecConfigurationRecord(byteBuffer.duplicate());
+    // Some video codecs (e.g. AV1, VP9) may not provide codec-specific data in the Format; in that
+    // case it is derived from the track's first sample.
+    if (track.format.initializationData.isEmpty() && track.parsedCsd == null) {
+      if (Objects.equals(track.format.sampleMimeType, MimeTypes.VIDEO_AV1)) {
+        track.parsedCsd = createAv1CodecConfigurationRecord(byteBuffer.duplicate());
+      } else if (Objects.equals(track.format.sampleMimeType, MimeTypes.VIDEO_VP9)) {
+        track.parsedCsd = buildVp9CodecPrivateFromUncompressedHeader(byteBuffer.duplicate());
+      }
     }
     if (!headerCreated) {
+      if (!allTracksReadyForMoov()) {
+        // The moov box (written before any fragment) needs the codec-specific data of every track,
+        // which for some video codecs is only available after the track's first sample. Buffer this
+        // sample and defer writing the header (and any fragment) until all tracks are ready. This
+        // avoids a crash when a sample for another track is written before such a video track's
+        // first sample.
+        track.writeSampleData(byteBuffer, bufferInfo);
+        updatePendingSampleTimestamps(track);
+        return;
+      }
       createHeader();
       headerCreated = true;
     }
@@ -165,6 +180,19 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       createFragment();
     }
     track.writeSampleData(byteBuffer, bufferInfo);
+    updatePendingSampleTimestamps(track);
+  }
+
+  /**
+   * Updates the min/max presentation timestamps from the given track's pending samples, if any.
+   *
+   * <p>Does nothing if the sample was not enqueued (empty/end-of-stream buffer, or a video sample
+   * before the first key frame), because there is then no pending sample to update timing from.
+   */
+  private void updatePendingSampleTimestamps(Track track) {
+    if (track.pendingSamplesBufferInfo.isEmpty()) {
+      return;
+    }
     BufferInfo firstPendingSample = checkNotNull(track.pendingSamplesBufferInfo.peekFirst());
     BufferInfo lastPendingSample = checkNotNull(track.pendingSamplesBufferInfo.peekLast());
     minInputPresentationTimeUs =
@@ -175,9 +203,31 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             lastPendingSample.presentationTimeUs - firstPendingSample.presentationTimeUs);
   }
 
+  /**
+   * Returns whether the moov box can be written yet, i.e. every track's codec-specific data is
+   * available. For some video codecs (AV1, VP9) with no codec-specific data in the {@link Format},
+   * it is derived from the track's first sample, so it is unavailable until that sample is written.
+   */
+  private boolean allTracksReadyForMoov() {
+    for (int i = 0; i < tracks.size(); i++) {
+      Track track = tracks.get(i);
+      if (track.format.initializationData.isEmpty()
+          && track.parsedCsd == null
+          && (Objects.equals(track.format.sampleMimeType, MimeTypes.VIDEO_AV1)
+              || Objects.equals(track.format.sampleMimeType, MimeTypes.VIDEO_VP9))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   public void close() throws IOException {
     try {
-      createFragment();
+      // If the header was never written (a track's codec-specific data never became available),
+      // there is no valid moov to precede a fragment, so skip writing one.
+      if (headerCreated) {
+        createFragment();
+      }
     } finally {
       outputChannel.close();
     }
